@@ -1,0 +1,9 @@
+---
+
+#Playbook para customização de acesso remoto para usuários e grupos
+#Customização de Banner Motd e Issue
+- name: Playbook de configuração de usuário local para acesso remoto
+  hosts: all
+  roles:
+   - usrlocal
+...

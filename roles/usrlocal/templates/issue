@@ -1,0 +1,18 @@
+-------------------------------------------------------------------------------
+                   EMPRESA XXX | DESCRICÃO XYZ
+                   POLITICAS REF.: PORTARIA XXXX
+
+Hostname.: "{{ ansible_fqdn }}"
+IP.: "{{ ansible_all_ipv4_addresses }}"
+Distro: "{{ ansible_distribution }}" "{{ ansible_distribution_version }}"
+Arch: "{{ ansible_architecture }}"
+
+ - O ACESSO AO SERVIDOR é RESTRITO à ADMINISTRADORES DE SISTEMAS;
+ - TODAS AS AÇõES SãO MONITORADAS E REGISTRADOS;
+  - é PROIBIDO O ACESSO NãO AUTORIZADA AOS ATIVOS DE REDE 
+DA EMPRESA XXX.
+ - AO AUTENTICAR, VOCê CONCORDA EM RESPEITAR AS POLíTICAS DO MMA CONFORME
+PORTARIA XXXX.
+
+--------------------------------------------------------------------------------
+

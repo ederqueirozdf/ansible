@@ -1,0 +1,37 @@
+---
+
+# Criacao do grupo local
+ - name: Criando grupo local
+   group:
+     name: '{{ usr_group_name }}'
+     state: present
+
+# Criacao de usuario local
+ - name: Criando usuario local
+   user:
+     name: user-srv
+     comment: Usuario de servico
+     groups: '{{ usr_group_name }}'
+     shell: /bin/bash
+     password: '{{ passwd }}'
+     createhome: yes
+
+# Copiando template
+ - name: Copiando template banner issue
+   template: src=issue dest=/etc/issue force=yes owner=root group=root
+
+# Copiando template motd
+ - name: Copiando template motd
+   template: src=motd dest=/etc/motd force=yes owner=root group=root
+     
+# Copia do arquivo sudoers
+ - name: Copiando arquivo sudoers
+   copy: src=sudoers dest=/etc/sudoers force=yes owner=root group=root backup=yes
+   when: ansible_facts['os_family'] == "RedHat"
+
+# Copia do arquivo csoc configurado para o netwitness
+ - name: Copiando arquivo sshd_conf
+   copy: src=sshd_config dest=/etc/ssh/sshd_config force=yes owner=root group=root backup=yes
+   notify: Reiniciando sshd
+   when: ansible_facts['os_family'] == "RedHat"
+...

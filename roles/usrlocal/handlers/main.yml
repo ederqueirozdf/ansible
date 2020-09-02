@@ -1,0 +1,7 @@
+---
+# Reiniciando serviço sshd
+- name: Reiniciando sshd
+  service:
+    name: sshd
+    state: restarted
+...
