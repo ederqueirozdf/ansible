@@ -1,0 +1,8 @@
+---
+# Reiniciando serviço ccm
+# Diretorio binario - /opt/microsoft/cm/bin/ccmexec
+- name: Reiniciando ccmexec
+  service:
+    name: ccmexecd
+    state: restarted
+...

@@ -1,0 +1,1372 @@
+#!/bin/sh
+
+#********************************************************
+#*                                                      *
+#*   Copyright (C) Microsoft. All rights reserved.      *
+#*                                                      *
+#********************************************************
+
+NOSTART=0
+HTTPS_CAPABLE=0
+NOCRLCHECK=0
+NOOUTPUT=1
+ALL_YES=0
+CLEAN_INSTALL=0
+KEEP_DB=0
+UPGRADE=0
+IGNORE_SHA256_VALIDATION_PARAM=0
+LOGGINGDIR=/var/opt/microsoft/cm
+TH_RETRYINTERVAL=0
+TH_MAXRETRIES=0
+
+if [ -n "$TMPDIR" ]; then
+  echo "Using alternate installation working directory at $TMPDIR"
+else
+  TMPDIR=/tmp
+
+fi
+
+usage()
+{
+    cat <<-END
+
+    This script installs the Microsoft System Center
+    Configuration Manager agent for Linux/Unix.
+
+    Usage:
+      install -mp <mp hostname> -sitecode <site code> [-dsroot <datastore directory>] [-nostart] [-clean/-keepdb] [-rootkeypath <file>] [-sitesigningcert <file>] [-fsp <fsp hostname> ][-NoCRLCheck] [-UsePKICert <file>] [-certpw <PKI cert passwd>] [-rootcerts <Comma,Separated,List,Of,Root,Certs>] [-httpport <port number> ] [ -httpsport <port number> ] [ -logdir <logfile directory> ] <archive file>
+
+      -clean                  On a reinstall, completely remove the earlier version.
+      -upgrade                Keep the database during an upgrade.
+      -keepdb                 Equivalent to -upgrade.
+      -certpw <password>      Password for PKI certificate
+      -dsroot <directory>     Directory in which to install the datastore.  Default: /var/opt/microsoft/cm
+      -fsp <fsp hostname>     Specifies a fallback status point.
+      -httpport <port>        Specifies port client should use when communicating over http.
+      -httpsport <port>       Specifies port client should use when communicating over https.
+      -mp <hostname>          Management Point hostname.
+      -NoCRLCheck             Specifies that a client should not check the certificate
+                              revocation list (CRL) when it communicates over HTTPS by using a PKI
+                              certificate.
+      -nostart                Install the agent, but do not start it.
+      -rootkeypath <file>     The location of the Trusted Root Key file
+      -sitecode <sitecode>    The site code for the ConfigMgr server supplied with -mp.
+      -sitesigningcert <file> The site signing certificate.
+      -UsePKICert <file>      Use the supplied X509 certificate in all communications
+      -rootcerts <file list>  Use the supplied additional root certificates for X509 certificate
+                              validation.  May be list of comma-separated files.
+      -logdir <directory>     Directory in which the log file is placed, Default: /var/opt/microsoft/cm
+      -ignoreSHA256validation Ignore all SHA256 based validations. Please consult the product documentation for security impact.
+      -CRL                    Import CRLs for certification validation as comma-separated list.
+      -ad <AD site name>      Name of the Active Directory site the server should use for Software Distribution content download.
+                              -ad is an optional parameter.  If specified, it may be set to ?, which tells the server to 
+                              determine the AD site to use based on IP address
+      -fuid                   Applicable only to upgrade from version 5.0.7958 and below. In installations where machines were 
+                              cloned, the system call gethostid(3p) did not return a unique identifier and resulted in a duplicate 
+                              hardware ID. This option forces those clients to re-register using a replacement algorithm that 
+                              does generate a unique ID.  The replacement algorithm is used by default on all clean installations.
+
+END
+}
+
+#==================================================#
+#        Basic Functions for Determining OS        #
+#==================================================#
+
+VERSION=
+PATCH=
+PLATFORM=
+ARCH=
+
+SuSE_Release="/etc/SuSE-release"
+SUSE_Release="/etc/SUSE-release"
+RH_Release="/etc/redhat-release"
+FED_Release="/etc/fedora-release"
+
+cleanup_gracefully() {
+    if [ -n "$1" ]; then
+        echo $1
+    fi
+    
+    cd $TMPDIR
+    rm -rf $TMPDIR/scxcm.$$
+    return 0
+}
+
+cleanup_and_exit() {
+    if [ -n "$1" ]; then
+        echo $1
+    fi
+    
+    check_if_pkg_is_installed ccm
+    if [ $? -eq 0 ]; then
+        remove_ccm_package
+    fi
+    
+    check_if_pkg_is_installed omi
+    if [ $? -eq 0 ]; then
+        remove_omi_package
+    fi
+    
+    cleanup_gracefully
+    exit 1
+}
+
+
+parse_command_line_args() {
+    
+# Parse Command Line Arguments
+    while [ $# -ge 1 ]; do
+        case $1 in
+            
+            -dsroot )
+                CM_DIR=$2
+                shift
+                ;;
+            
+            -devinstall )
+                DEVINSTALL=1
+                CM_BINDIR=$2
+                shift
+                ;;
+            
+            -fsp )
+                FSP_PARAM=$2
+                shift
+                ;;
+            
+            -rootkeypath )
+                case $2 in
+                    /*)
+                        ROOT_KEY_PATH=$2
+                        ;;
+                    *)
+                        ROOT_KEY_PATH=`pwd`"/"$2
+                        ;;
+                esac
+                shift
+                ;;
+            
+            -sitecode )
+                SITECODE_PARAM=`echo $2 | tr "[a-z]" "[A-Z]"`
+                shift
+                ;;
+            
+            -fuid )
+                FORCE_UNIQUE_HOSTID_PARAM=1
+                shift
+                ;;
+            
+            -ad )
+                ADSITE_NAME_PARAM=$2
+                shift
+                ;;
+            
+            -clean )
+                if [ $KEEP_DB -ne 0 ]; then
+                    echo "-clean is incompatible with -keepdb, exiting..."
+                    exit 50
+                fi
+                CLEAN_INSTALL=1
+                ;;
+            
+            # In spite of this being the default behavior, this option is necessary
+            # so that we can differentiate the default behavior from user selected
+            # behavior. The latter case, we can skip prompting for what to do on
+            # re-install.
+            -keepdb|-upgrade)
+                if [ $CLEAN_INSTALL -ne 0 ]; then
+                    echo "-keepdb/-upgrade is incompatible with -clean, exiting..."
+                    exit 51
+                fi
+                UPGRADE=1
+                ;;
+            
+            -debug )
+                DEBUG=1
+                #set -x
+                ;;
+            
+            -logdir )
+                case $2 in
+                    /*)
+                        LOGGINGDIR=$2
+                        ;;
+                    *)
+                        LOGGINGDIR=`pwd`"/"$2
+                        ;;
+                esac
+                shift
+                ;;
+            
+            -mp )
+                MP_PARAM=$2
+                shift
+                ;;
+            
+            -nostart )
+                NOSTART=1
+                ;;
+            
+            -showoutput )
+                NOOUTPUT=0
+                ;;
+            
+            -httpport )
+                HTTP_PORT_PARAM=$2
+                shift;
+                ;;
+            
+            -httpsport )
+                HTTPS_PORT_PARAM=$2
+                shift;
+                ;;
+            
+            -UsePKICert )
+                HTTPS_CAPABLE=1
+                case $2 in
+                    /*)
+                        SIGN_CERT_PATH=$2
+                        ;;
+                    *)
+                        SIGN_CERT_PATH=`pwd`"/"$2
+                        ;;
+                esac
+                shift
+                ;;
+            
+            -rootcerts )
+                case $2 in
+                    /*)
+                        ADDL_ROOT_CERTS=$2
+                        ;;
+                    *)
+                        ADDL_ROOT_CERTS=`pwd`"/"$2
+                        ;;
+                esac
+                shift
+                ;;
+            
+            -NoCRLCheck )
+                NOCRLCHECK=1
+                ;;
+            
+            -certpw )
+                SIGN_CERT_PASSWORD=$2
+                shift
+                ;;
+            
+            -sitesigningcert )
+                case $2 in
+                    /*)
+                        SITE_SIGN_CERT_PATH=$2
+                        ;;
+                    *)
+                        SITE_SIGN_CERT_PATH=`pwd`"/"$2
+                        ;;
+                esac
+                shift
+                ;;
+            
+            -ignoreSHA256validation )
+                IGNORE_SHA256_VALIDATION_PARAM=1
+                ;;
+            
+            -CRL )
+                case $2 in
+                    /*)
+                        CRL_LIST=$2
+                        ;;
+                    *)
+                        CRL_LIST=`pwd`"/"$2
+                        ;;
+                esac
+                shift
+                ;;
+            
+            -TH_RetryInterval )
+                TH_RETRYINTERVAL=$2
+                shift;
+            ;;
+
+            -TH_MaxRetries )
+                TH_MAXRETRIES=$2
+                shift;
+            ;;
+
+            -* )
+                usage
+                exit 1
+                ;;
+            
+            *)
+                TARFILE=$1
+                
+                # Compute absolute path of archive file...
+                tarrootdir=`dirname $TARFILE`
+                
+                # If directory does not start with leading slash..
+                echo $tarrootdir | grep "^/" 2> /dev/null 1> /dev/null
+                if [ $? -ne 0 ]; then
+                    
+                    if [ ! -d "$tarrootdir" ]; then
+                        echo "Archive file directory does not exist..."
+                        exit 1
+                    fi
+                    
+                    tarrootdir=`(cd $tarrootdir; pwd)`
+                fi
+                
+                TARFILE=$tarrootdir/`basename $TARFILE`
+                
+                if [ ! -r $TARFILE ]; then
+                    echo "Archive file not found or no read permissions."
+                    exit 1
+                fi
+                
+                ;;
+        esac
+        shift
+    done    
+}
+
+check_command_line_args() {
+    
+    if [ $UPGRADE -eq 1 -a $CLEAN_INSTALL -eq 1 ]; then
+        echo "**** Error: -clean and -keepdb/-upgrade are not compatible. ****"
+        exit 1
+    fi
+    
+    if [ -z "$MP_PARAM" ]; then
+        echo "**** Missing required parameter: -mp <mp hostname> ****"
+        echo
+        usage
+        exit 1
+    fi
+    
+    if [ -z "$TARFILE" ]; then
+        echo "**** Missing required parameter: <archive file> ****"
+        echo
+        usage
+        exit 1
+    fi
+    
+    if [ -z "$SITECODE_PARAM" ]; then
+        echo "**** Missing required parameter: -sitecode <sitecode> ****"
+        echo
+        usage
+        exit 1
+    fi
+    
+    if [ -n "$SIGN_CERT_PATH" ]; then
+        if [ ! -r "$SIGN_CERT_PATH" ]; then
+            echo "Error : The Signing Certificate path specified does not exist or it not a valid file path."
+            exit 53
+        fi
+        
+        if [ -z "$CRL_LIST" ]; then
+            if [ $NOCRLCHECK -eq 0 ]; then
+                echo "Error : If PKI certificates are used CRLs have to be specified. If not specify -NoCRLCheck override."
+                exit 53
+            fi
+        fi
+        
+        if [ -z "$SIGN_CERT_PASSWORD" ]; then
+            # TODO: Trap  so we can reset stty properly afterwards.
+            echo $ECHO_FLAG "Enter Signing Certificate password :\c"
+            stty -echo
+            read SIGN_CERT_PASSWORD
+            stty echo
+            echo ""
+        fi
+    fi
+    
+    if [ -n "$ADDL_ROOT_CERTS" ]; then
+        if [ -z "$SIGN_CERT_PATH" ]; then
+            echo "Error : Root certificates are not appropriate without -UsePKICert qualifier"
+            exit 54
+        fi
+        
+        # Validate that the additional root certificate specifications are all valid
+        
+        SAVED_IFS="$IFS"
+        IFS=","
+        
+        for i in $ADDL_ROOT_CERTS; do
+            if [ ! -r "$i" ]; then
+                echo "Error : -rootcerts file \"$i\" does not exist or it not a valid file path."
+                exit 54
+            fi
+        done
+        
+        IFS="$SAVED_IFS"
+    fi
+    
+    if [ -n "$CRL_LIST" ]; then
+        
+        # If CRL was specified the UsePKICert has to be specified
+        if [ -z "$SIGN_CERT_PATH" ]; then
+            echo "Error : CRLs are not appropriate without -UsePKICert qualifier"
+            exit 100
+        fi
+        
+        # If CRL was specified then NOCRLCHECK should not be specified
+        if [ $NOCRLCHECK -ne 0 ]; then
+            echo "Error : -NoCRLCheck cannot be specified with CRLs"
+            exit 101
+        fi
+    fi
+    
+    if [ -n "$SITE_SIGN_CERT_PATH" ]; then
+        if [ ! -r "$SITE_SIGN_CERT_PATH" ]; then
+            echo "Error : The Site Server Signing Certificate path specified does not exist or it not a valid file path."
+            exit 55
+        fi
+    fi
+    
+    if [ $CCM_IS_INSTALLED -eq 0 ]; then
+        if [ $CLEAN_INSTALL -ne 1 -a $UPGRADE -ne 1 ]; then
+            echo "Error: The Configuration Manager agent is currently installed.  Please do one of the following:"
+            echo "   1. Install the agent with the '-clean' option.  This will erase the current datastore."
+            echo "or 2. Install the agent with the '-upgrade' option.  This will save the previous datastore."
+        fi
+    fi
+}
+
+
+
+GetARCHInternal() {
+    
+    case "$PLATFORM" in
+        MacOS | Hpux | Universal | RHEL | SLES)
+            ARCH=`uname -m`
+            ;;
+        
+        *)
+            ARCH=`uname -p`
+            ;;
+    esac
+    
+    case $ARCH in
+        
+        x86_64 )
+            ARCH=x64
+            ;;
+        
+        i386|i486|i586|i686 )
+            ARCH=x86;
+            ;;
+        
+        9000/*)
+            ARCH=PA
+            ;;
+        
+        ia64)
+            ARCH=i64
+            ;;
+        
+        ppc|ppc64|powerpc)
+            ARCH=ppc
+            ;;
+        
+    esac
+}
+
+
+GetLinuxInfo() {
+    
+    OSName=`/bin/egrep -o 'Red Hat Enterprise Linux AS|Red Hat Enterprise Linux ES|Red Hat Enterprise Linux|Red Hat Enterprise Linux Server|Red Hat Enterprise Client|Red Hat Enterprise Desktop|SUSE Linux Enterprise Desktop|SUSE Linux Enterprise Server|SUSE LINUX Enterprise Server' $1`
+    
+    case $OSName in
+        
+        "Red Hat Enterprise Linux Server" | "Red Hat Enterprise Linux ES" | "Red Hat Enterprise Linux AS" )
+            PLATFORM=RHEL
+            if [ "$includePatchInfo" = "true" ]; then
+                VERSION=`grep "$OSName" $1 | sed  's/[^0-9]*//g'`
+            else
+                VERSION=`grep "$OSName" $1 | sed s/.*release\ // | sed s/[\.\ ].*//`
+            fi
+            ;;
+        
+        "SUSE LINUX Enterprise Server"|"SUSE Linux Enterprise Server")
+            PLATFORM=SLES
+            VERSION=`grep VERSION "$1" | sed 's/[ \t]//g;s/.*=//'`
+            if [ "$includePatchInfo" = "true" ]; then
+                PATCH=`grep PATCH $1 | sed 's/[ \t]//g;s/.*=//'`
+            fi
+            ;;
+        
+        * )
+            PLATFORM=Universal
+            VERSION=
+            ;;
+        
+    esac
+}
+
+
+GetARCH()
+{
+    case `uname -s` in
+        
+        Linux )
+            if [ -r $SuSE_Release ]; then
+                GetLinuxInfo "$SuSE_Release"
+                # after the dust settles, we can remove this ALTPLATFORM and ALTVERSION logic
+                # and just simply install only universal for supported platforms.
+                if [ "$VERSION" != "9" ]; then
+                    ALTPLATFORM=Universal
+                    ALTVERSION=
+                fi
+            elif [ -r $SUSE_Release ]; then
+                GetLinuxInfo "$SUSE_Release"
+                if [ "$VERSION" != "9" ]; then
+                    ALTPLATFORM=Universal
+                    ALTVERSION=
+                fi
+            elif [ -r $RH_Release ]; then
+                GetLinuxInfo "$RH_Release"
+                if [ "$VERSION" != "4" ]; then
+                    ALTPLATFORM=Universal
+                    ALTVERSION=
+                fi
+            else
+                PLATFORM=Universal
+                VERSION=
+            fi
+            ;;
+        
+        HP-UX )
+            VERSION=`uname -r`
+            PLATFORM=Hpux
+            ;;
+        
+        AIX )
+            VERSION=`oslevel | sed 's/\.//g;s/0//g'`
+            PLATFORM=Aix
+            ;;
+        
+        SunOS )
+            PLATFORM=Sol
+            VERSION=`uname -r | sed 's/[0-9]\.//'`
+            ;;
+        
+        Darwin )
+            PLATFORM=MacOS
+            if [ "$includePatchInfo" = "true" ]; then
+                VERSION=`sw_vers -productVersion | sed 's/[^0-9]*//g'`
+            else
+                VERSION=`sw_vers -productVersion | sed 's/\([0-9][0-9]\)\.\([0-9]\)\.\([0-9]\)/\1\2/;s/[^0-9]*//g'`
+            fi
+            
+            ;;
+        
+        *)
+            echo "Unknown"
+            exit 0
+            ;;
+        
+    esac
+    
+    GetARCHInternal
+    
+    OS=${PLATFORM}${VERSION}${PATCH}${ARCH}
+    ALTOS=${ALTPLATFORM}${ALTVERSION}${PATCH}${ARCH}
+}
+
+write_env_files()
+{
+    mkdir -p /etc/opt/microsoft/cm/
+    touch /etc/opt/microsoft/cm/install_env
+    chmod 700 /etc/opt/microsoft/cm/install_env
+    cat > /etc/opt/microsoft/cm/install_env <<EOF
+DEBUG=$DEBUG
+UPGRADE=$UPGRADE
+MIGRATE_DS=$MIGRATE_DS
+NOSTART=$NOSTART
+LOGGINGDIR=$LOGGINGDIR
+CM_HOME=$CM_DIR
+CM_MP=$MP_PARAM
+CM_SITECODE=$SITECODE_PARAM
+CM_FSP=$FSP_PARAM
+HTTP_PORT=$HTTP_PORT_PARAM
+HTTPS_PORT=$HTTPS_PORT_PARAM
+HTTPS_CAPABLE=$HTTPS_CAPABLE
+IGNORE_SHA256_VALIDATION=$IGNORE_SHA256_VALIDATION_PARAM
+ADSITE_NAME=$ADSITE_NAME_PARAM
+FORCE_UNIQUE_HOSTID=$FORCE_UNIQUE_HOSTID_PARAM
+CRL_LIST=$CRL_LIST
+ADDL_ROOT_CERTS=$ADDL_ROOT_CERTS
+SIGN_CERT_PATH=$SIGN_CERT_PATH
+SIGN_CERT_PASSWORD=$SIGN_CERT_PASSWORD
+SITE_SIGN_CERT_PATH=$SITE_SIGN_CERT_PATH
+ROOT_KEY_PATH=$ROOT_KEY_PATH
+IGNORE_CRL_CHECK=$NOCRLCHECK
+TH_MAXRETRIES=$TH_MAXRETRIES
+TH_RETRYINTERVAL=$TH_RETRYINTERVAL
+
+EOF
+
+}
+
+get_tmp_free_space() {
+    #Print returns the free space in $TMPDIR in KB
+    TMP_OS="`uname -s`"
+    case "$TMP_OS" in
+        Linux | AIX )
+            TMP_FREE=`df -k -P $TMPDIR | tail -1 | awk '{print $4}'`
+            ;;
+        SunOS )
+            TMP_FREE=`df -b $TMPDIR | tail -1 | awk '{print $2}'`
+            ;;
+        HP-UX )
+            TMP_FREE=`df -b $TMPDIR | awk '{print $5}'`
+            ;;
+        * )
+            cleanup_and_exit "Untested on $TMP_OS"
+            ;;
+    esac
+}
+
+can_extract() {
+    #Check that there is enough space in $TMPDIR for extraction
+
+    if [ "`uname -s`" = "AIX" -a "`which tar`" = "/usr/bin/tar" ]; then
+        TAR_SIZE_BYTES=`tar -tvf $TARFILE_FULLPATH | awk '{ size_sum += $4 } END { printf( "%d", size_sum) }'`
+    else
+        TAR_SIZE_BYTES=`tar -tvf $TARFILE_FULLPATH | awk '{ size_sum += $3 } END { printf( "%d", size_sum) }'`
+    fi
+    
+    REQUIRED_BYTES=`expr $TAR_SIZE_BYTES \* 2 / 1024`
+    get_tmp_free_space
+    AVAILABLE_BYTES=`expr $TMP_FREE`
+    
+    if [ $REQUIRED_BYTES -lt $AVAILABLE_BYTES ]; then
+        return 0 # OK
+    else
+        return 1 #Not enough space
+    fi
+}
+
+extract_tar_file() {
+    rm -rf $TMPDIR/scxcm.*
+    TEMPTARDIR=$TMPDIR/scxcm.$$
+    BASE_TARFILE=`basename $TARFILE`
+    
+    # Get an absolute path for the tar file
+    case $TARFILE in
+        /*)
+            TARFILE_FULLPATH=$TARFILE
+            ;;
+        *)
+            TARFILE_FULLPATH=`pwd`"/"$TARFILE
+            ;;
+    esac
+    
+    mkdir -m 700 $TEMPTARDIR
+    if [ $? -ne 0 ]; then
+        cleanup_and_exit "Error: Unable to create temp directory with root only permissions at $TEMPTARDIR."
+    fi
+    
+    can_extract
+    if [ $? -ne 0 ]; then
+        cleanup_and_exit "Error: Not enough space in $TMPDIR for extraction : Requires: $REQUIRED_BYTES bytes, Free: $AVAILABLE_BYTES bytes"
+    fi
+    
+    cd $TEMPTARDIR
+    # Does the file end in .Z?
+    if [ `echo $BASE_TARFILE | grep "\.Z$"` ]; then
+        uncompress -c $TARFILE_FULLPATH | tar xfo -
+    elif [ `echo $BASE_TARFILE | grep "\.gz$"` ]; then
+        gunzip -c $TARFILE_FULLPATH | tar xfo -
+    else
+        tar xfo $TARFILE_FULLPATH
+    fi
+    
+    if [ $? -ne 0 ]; then
+        cleanup_and_exit "An unexpected error occured while unpacking $BASE_TARFILE."
+    fi
+}
+
+
+validate_build_architecture()
+{
+    buildarch=`cat buildarch`
+    if [ "$OS" != "$buildarch" ]; then
+        if [ "$ALTOS" != "$buildarch" ]; then
+            echo "The OS/Version/Architecture of this archive file does not match this system, exiting..."
+            exit 1
+        else
+            # this is a universal build
+            OS=$ALTOS
+            PLATFORM=$ALTPLATFORM
+            VERSION=$ALTVERSION
+        fi
+    fi
+}
+
+
+ulinux_detect_openssl_version() {
+    # override TMPBINDIR with the OpenSSL version supported on this system
+    TMPBINDIR=bin
+    # this code was taken from OM's build process.  Logic is slightly reversed: if OPENSSL_SYSTEM_VERSION_098 == 0, then
+    # the system OpenSSL version is 0.9.8.  Likewise with OPENSSL_SYSTEM_VERSION_100
+    if [ "$PLATFORM" = "Universal" -o "$ALTPLATFORM" = "Universal" ]; then
+        # Check if dpkg or rpm is installed; we need at least one.  Default to rpm if system has both
+        which dpkg 2> /dev/null 1> /dev/null
+        DPKG_AVAILABLE=$?
+        which rpm 2> /dev/null 1> /dev/null
+        RPM_AVAILABLE=$?
+
+        OPENSSL_SYSTEM_VERSION_FULL=`openssl version | awk '{print $2}'`
+        OPENSSL_SYSTEM_VERSION_098=`echo $OPENSSL_SYSTEM_VERSION_FULL | grep -Eq '^0.9.8'; echo $?`
+        OPENSSL_SYSTEM_VERSION_100=`echo $OPENSSL_SYSTEM_VERSION_FULL | grep -Eq '^1.0.'; echo $?`
+        if [ $OPENSSL_SYSTEM_VERSION_098 = 0 ]; then
+            TMPBINDIR=bin_098
+        elif [ $OPENSSL_SYSTEM_VERSION_100 = 0 ]; then
+            TMPBINDIR=bin_100
+        else
+            echo "Error: This system does not have a supported version of OpenSSL installed."
+            echo "This system's OpenSSL version: $OPENSSL_SYSTEM_VERSION_FULL"
+            echo "Supported versions: 0.9.8*, 1.0.*"
+            exit 60
+        fi
+    fi
+}
+
+
+# $1 should be the name of the package to look for (on SunOS this will be prepended by MSFT)
+check_if_pkg_is_installed() {
+    case "$OS" in
+        Aix* )
+            lslpp -l $1.rte 2> /dev/null 1> /dev/null
+            return $?
+            ;;
+        
+        Hpux* )
+            swlist $1 2> /dev/null 1> /dev/null
+            return $?
+            ;;
+        
+        RHEL*|SLES* )
+            rpm -q $1 2> /dev/null 1> /dev/null
+            return $?
+            ;;
+        
+        Sol* )
+            /usr/bin/pkginfo "MSFT"$1 2> /dev/null 1> /dev/null
+            return $?
+            ;;
+        
+        Universal* )
+            if [ "$DPKG_AVAILABLE" = "0" ]; then
+                dpkg -s $1 | grep Status | grep " installed" 2> /dev/null 1> /dev/null
+                return $?
+            elif [ "$RPM_AVAILABLE" = "0" ]; then
+                rpm -q $1 2> /dev/null 1> /dev/null
+                return $?
+            else
+                # Package is not installed on a system without a package manager
+                return 1
+            fi
+            ;;
+    esac
+}
+
+remove_omi_package() {
+    case "$OS" in
+        Aix* )
+            installp -u omi.rte
+            ;;
+        
+        Hpux* )
+            swremove omi
+            ;;
+        
+        RHEL*|SLES*)
+            rpm -e omi
+            ;;
+        
+        Sol* )
+            ADMIN_FILE=$TMPDIR/scxcm.$$/scxcm-admin
+            cat <<EOF > $ADMIN_FILE
+mail=
+instance=overwrite
+partial=nocheck
+idepend=quit
+rdepend=quit
+conflict=nocheck
+action=nocheck
+basedir=default
+EOF
+            /usr/sbin/pkgrm -a $ADMIN_FILE -n MSFTomi
+            ;;
+        
+        Universal* )
+            if [ "$DPKG_AVAILABLE" = "0" ]; then
+                dpkg --purge omi
+            elif [ "$RPM_AVAILABLE" = "0" ]; then
+                rpm -e omi
+            else
+                cleanup_and_exit "Unable to find supported Linux package manager (dpkg/rpm) in \$PATH."
+            fi
+            ;;
+    esac
+}
+
+remove_ccm_package() {
+    case "$OS" in
+        Aix* )
+            installp -u ccm.rte
+            ;;
+        
+        Hpux* )
+            swremove ccm
+            ;;
+        
+        RHEL*|SLES*)
+            rpm -e ccm
+            ;;
+        
+        Sol* )
+            ADMIN_FILE=$TMPDIR/scxcm.$$/scxcm-admin
+            cat <<EOF > $ADMIN_FILE
+mail=
+instance=overwrite
+partial=nocheck
+idepend=quit
+rdepend=quit
+conflict=nocheck
+action=nocheck
+basedir=default
+EOF
+            /usr/sbin/pkgrm -a $ADMIN_FILE -n MSFTccm
+            ;;
+        
+        Universal* )
+            if [ "$DPKG_AVAILABLE" = "0" ]; then
+                dpkg -r ccm
+            elif [ "$RPM_AVAILABLE" = "0" ]; then
+                rpm -e ccm
+            else
+                cleanup_and_exit "Unable to find supported Linux package manager (dpkg/rpm) in \$PATH."
+            fi
+            ;;
+    esac
+    
+    if [ $? -ne 0 ]; then
+        echo "Unable to uninstall OMI. This is probably due to another package that relies on OMI."
+    fi
+}
+
+install_omi_package() {
+    
+    case "$OS" in
+        Aix* )
+            installp -X -d $TEMPTARDIR/omi-*.lpp omi.rte
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install omi."
+            fi
+            ;;
+        
+        Hpux* )
+            swinstall -s $TEMPTARDIR/omi-*.depot omi
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install omi."
+            fi
+            ;;
+        
+        RHEL*|SLES*)
+            rpm -i omi-*.rpm
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install omi."
+            fi
+            ;;
+        
+        Sol* )
+            ADMIN_FILE=$TMPDIR/scxcm.$$/scxcm-admin
+            cat <<EOF > $ADMIN_FILE
+mail=
+instance=overwrite
+partial=nocheck
+idepend=quit
+rdepend=quit
+conflict=nocheck
+action=nocheck
+basedir=default
+EOF
+            
+            /usr/sbin/pkgadd -a $ADMIN_FILE -n -d omi-*.pkg MSFTomi
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install omi."
+            fi
+            ;;
+        
+        Universal* )
+            if [ "$OPENSSL_SYSTEM_VERSION_098" = "0" ]; then
+                PREFIXDIR="098"
+            else
+                PREFIXDIR="100"
+            fi
+
+            if [ "$DPKG_AVAILABLE" = "0" ]; then
+                dpkg -i --force-confold --force-confdef $PREFIXDIR/omi-*.deb
+                if [ $? -ne 0 ]; then
+                    cleanup_and_exit "Unable to install omi."
+                fi            
+            elif [ "$RPM_AVAILABLE" = "0" ]; then
+                rpm -i $PREFIXDIR/omi-*.rpm
+                if [ $? -ne 0 ]; then
+                    cleanup_and_exit "Unable to install omi."
+                fi
+            else
+                cleanup_and_exit "Unable to find supported Linux package manager (dpkg/rpm) in \$PATH."
+            fi
+            ;;
+    esac
+}
+
+install_ccm_package() {
+    case "$OS" in
+        Aix* )
+            installp -X -d $TEMPTARDIR/ccm-*.lpp ccm.rte
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install ccm."
+            fi
+            ;;
+        
+        Hpux* )
+            swinstall -s $TEMPTARDIR/ccm-*.depot ccm
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install ccm."
+            fi
+            ;;
+        
+        RHEL*|SLES*)
+            rpm -i ccm-*.rpm
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install ccm."
+            fi
+            ;;
+        
+        Sol* )
+            ADMIN_FILE=$TMPDIR/scxcm.$$/scxcm-admin
+            cat <<EOF > $ADMIN_FILE
+mail=
+instance=overwrite
+partial=nocheck
+idepend=quit
+rdepend=quit
+conflict=nocheck
+action=nocheck
+basedir=default
+EOF
+            
+            /usr/sbin/pkgadd -a $ADMIN_FILE -n -d ccm-*.pkg MSFTccm
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install ccm."
+            fi
+            ;;
+        
+        Universal* )
+            if [ "$OPENSSL_SYSTEM_VERSION_098" = "0" ]; then
+                PREFIXDIR="098"
+            else
+                PREFIXDIR="100"
+            fi
+
+            if [ "$DPKG_AVAILABLE" = "0" ]; then
+                dpkg -i --force-confold --force-confdef $PREFIXDIR/ccm-*.deb
+                if [ $? -ne 0 ]; then
+                    cleanup_and_exit "Unable to install ccm."
+                fi            
+            elif [ "$RPM_AVAILABLE" = "0" ]; then
+                rpm -i $PREFIXDIR/ccm-*.rpm
+                if [ $? -ne 0 ]; then
+                    cleanup_and_exit "Unable to install ccm."
+                fi
+            else
+                cleanup_and_exit "Unable to find supported Linux package manager (dpkg/rpm) in \$PATH."
+            fi
+            ;;
+    esac
+}
+
+upgrade_omi_package() {
+    
+    case "$OS" in
+        Aix* )
+            installp -X -F -d $TEMPTARDIR/omi-*.lpp omi.rte
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install omi."
+            fi
+            ;;
+        
+        Hpux* )
+            swinstall -x allow_downdate=true -x reinstall=true -s $TEMPTARDIR/omi-*.depot omi
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install omi."
+            fi
+            ;;
+        
+        RHEL*|SLES*)
+            rpm -U --force omi-*.rpm
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install omi."
+            fi
+            ;;
+        
+        Sol* )
+            ADMIN_FILE=$TMPDIR/scxcm.$$/scxcm-admin
+            # Note: we forcibly remove ('nocheck' for rdepend) the omi package on upgrade on Solaris before we install it.  This is because ccm/scx may have a dependency on omi.
+            cat <<EOF > $ADMIN_FILE
+mail=
+instance=overwrite
+partial=nocheck
+idepend=quit
+rdepend=nocheck
+conflict=nocheck
+action=nocheck
+basedir=default
+EOF
+            
+            /usr/sbin/pkgrm -a $ADMIN_FILE -n MSFTomi
+            /usr/sbin/pkgadd -a $ADMIN_FILE -n -d omi-*.pkg MSFTomi
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install omi."
+            fi
+            ;;
+        
+        Universal* )
+            if [ "$OPENSSL_SYSTEM_VERSION_098" = "0" ]; then
+                PREFIXDIR="098"
+            else
+                PREFIXDIR="100"
+            fi
+
+            if [ "$DPKG_AVAILABLE" = "0" ]; then
+                dpkg -i --force-confold --force-confdef --refuse-downgrade $PREFIXDIR/omi-*.deb
+                if [ $? -ne 0 ]; then
+                    cleanup_and_exit "Unable to install omi."
+                fi            
+            elif [ "$RPM_AVAILABLE" = "0" ]; then
+                rpm -U --force $PREFIXDIR/omi-*.rpm
+                if [ $? -ne 0 ]; then
+                    cleanup_and_exit "Unable to install omi."
+                fi
+            else
+                cleanup_and_exit "Unable to find supported Linux package manager (dpkg/rpm) in \$PATH."
+            fi
+            ;;
+    esac
+}
+
+upgrade_ccm_package() {
+    case "$OS" in
+        Aix* )
+            installp -X -F -d $TEMPTARDIR/ccm-*.lpp ccm.rte
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install ccm."
+            fi
+            ;;
+        
+        Hpux* )
+            swinstall -x allow_downdate=true -x reinstall=true -s $TEMPTARDIR/ccm-*.depot ccm
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install ccm."
+            fi
+            ;;
+        
+        RHEL*|SLES*)
+            rpm -U --force --nopreun ccm-*.rpm
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install ccm."
+            fi
+            ;;
+        
+        Sol* )
+            ADMIN_FILE=$TMPDIR/scxcm.$$/scxcm-admin
+            cat <<EOF > $ADMIN_FILE
+mail=
+instance=overwrite
+partial=nocheck
+idepend=quit
+rdepend=quit
+conflict=nocheck
+action=nocheck
+basedir=default
+EOF
+            
+            /usr/sbin/pkgrm -a $ADMIN_FILE -n MSFTccm
+            /usr/sbin/pkgadd -a $ADMIN_FILE -n -d ccm-*.pkg MSFTccm
+            if [ $? -ne 0 ]; then
+                cleanup_and_exit "Unable to install ccm."
+            fi
+            ;;
+        
+        Universal* )
+            if [ "$OPENSSL_SYSTEM_VERSION_098" = "0" ]; then
+                PREFIXDIR="098"
+            else
+                PREFIXDIR="100"
+            fi
+
+            if [ "$DPKG_AVAILABLE" = "0" ]; then
+                dpkg -i --force-confold --force-confdef --refuse-downgrade $PREFIXDIR/ccm-*.deb
+                if [ $? -ne 0 ]; then
+                    cleanup_and_exit "Unable to install ccm."
+                fi            
+            elif [ "$RPM_AVAILABLE" = "0" ]; then
+                # in next release, we ill remove --nopreun option and check upgrade/uninstall to determine if run preuninstall section
+                rpm -U --force --nopreun $PREFIXDIR/ccm-*.rpm
+                if [ $? -ne 0 ]; then
+                    cleanup_and_exit "Unable to install ccm."
+                fi
+            else
+                cleanup_and_exit "Unable to find supported Linux package manager (dpkg/rpm) in \$PATH."
+            fi
+            ;;
+    esac
+}
+
+
+getVersionNumber()
+{
+    # Parse a version number from a string.
+    #
+    # Parameter 1: string to parse version number string from
+    #     (should contain something like mumble-4.2.2.135.universal.x86.tar)
+    # Parameter 2: prefix to remove ("mumble-" in above example)
+
+    if [ $# -ne 2 ]; then
+        echo "INTERNAL ERROR: Incorrect number of parameters passed to getVersionNumber" >&2
+        cleanup_and_exit 1
+    fi
+
+    echo $1 | sed -e "s/$2//" -e 's/\.universal\..*//' -e 's/\.x64.*//' -e 's/\.x86.*//' -e 's/-/./'
+}
+
+check_if_attempt_omi_upgrade() {
+    # Get version of OMI about to be upgraded to, and version of OMI installed
+    
+    case "$OS" in
+        Aix* )
+            version="`lslpp -L omi.rte | awk 'NR==3 { print $2 }'`"
+            INSTALLED_VERSION=`getVersionNumber "$version" "Version: "`
+            FILE_VERSION=`getVersionNumber omi-*.lpp omi-`
+            ;;
+
+        Hpux* )
+            version="`swlist | grep omi | awk '{print $2}'`"
+            INSTALLED_VERSION=`getVersionNumber "$version" "Version: "`
+            FILE_VERSION=`getVersionNumber omi-*.depot omi-`
+            ;;
+
+        Sol* )
+            INSTALLED_VERSION=`pkginfo -l MSFTomi | grep VERSION | awk '{ print $2 }'`
+            FILE_VERSION=`pkginfo -l -d $TEMPTARDIR/omi-*.pkg | grep VERSION | awk '{ print $2 }'`
+            ;;
+
+        Universal*|RHEL*|SLES* )
+            if [ "$OPENSSL_SYSTEM_VERSION_098" = "0" ]; then
+                PREFIXDIR="098"
+            elif [ "$OPENSSL_SYSTEM_VERSION_100" = "0" ]; then
+                PREFIXDIR="100"
+            else
+                PREFIXDIR="."
+            fi
+
+            if [ "$DPKG_AVAILABLE" = "0" ]; then
+                local version="`dpkg -s omi 2> /dev/null | grep 'Version: '`"
+                INSTALLED_VERSION=`getVersionNumber "$version" "Version: "`
+                FILE_VERSION=`(cd $PREFIXDIR; getVersionNumber omi-*.deb omi-)`
+            elif [ "$RPM_AVAILABLE" = "0" ]; then
+                local version=`rpm -q omi 2> /dev/null`
+                INSTALLED_VERSION=`getVersionNumber $version omi-`
+                FILE_VERSION=`(cd $PREFIXDIR; getVersionNumber omi-*.rpm omi-)`
+            fi
+
+            ;;
+    esac
+
+    # Current version installed
+    INS_MAJOR=`echo $INSTALLED_VERSION | cut -d. -f1`
+    INS_MINOR=`echo $INSTALLED_VERSION | cut -d. -f2`
+    INS_PATCH=`echo $INSTALLED_VERSION | cut -d. -f3`
+    INS_BUILD=`echo $INSTALLED_VERSION | cut -d. -f4`
+
+    # Available version number
+    AVA_MAJOR=`echo $FILE_VERSION | cut -d. -f1`
+    AVA_MINOR=`echo $FILE_VERSION | cut -d. -f2`
+    AVA_PATCH=`echo $FILE_VERSION | cut -d. -f3`
+    AVA_BUILD=`echo $FILE_VERSION | cut -d. -f4`
+
+    # Check bounds on MAJOR
+    if [ $INS_MAJOR -gt $AVA_MAJOR ]; then
+        return 0
+    elif [ $INS_MAJOR -lt $AVA_MAJOR ]; then
+        return 1
+    fi
+
+    # Defer to MINOR number
+    if [ $INS_MINOR -gt $AVA_MINOR ]; then
+        return 0
+    elif [ $INS_MINOR -lt $AVA_MINOR ]; then
+        return 1
+    fi
+
+    # Defer to PATCH number
+    if [ $INS_PATCH -gt $AVA_PATCH ]; then
+        return 0
+    elif [ $INS_PATCH -lt $AVA_PATCH ]; then
+        return 1
+    fi
+
+    if [ -n "$INS_BUILD" -a -n "$AVA_BUILD" ]; then
+        # Defer to BUILD number
+        if [ $INS_BUILD -gt $AVA_BUILD ]; then
+            return 0
+        elif [ $INS_BUILD -lt $AVA_BUILD ]; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+#==================================================#
+#                 Script Begins Here               #
+#==================================================#
+
+GetARCH
+
+ExtraLibPath=
+case "$OS" in
+    Sol9*)
+        ExtraLibPath=:/usr/local/lib:/usr/local/ssl/lib
+        ;;
+esac
+
+case "$OS" in
+    Sol11*)
+        whoami=`/usr/bin/whoami`
+        ;;
+    
+    Sol*)
+        whoami=`/usr/ucb/whoami`
+        ;;
+    
+    *)
+        whoami=`whoami`
+        ;;
+esac
+
+if [ "$whoami" != "root" ]; then
+    echo "You must be root to install this product."
+    exit 2
+fi
+
+SIGN_CERT_PATH=""
+SIGN_CERT_PASSWORD=""
+ADDL_ROOT_CERTS=""
+SITE_SIGN_CERT_PATH=""
+CRL_LIST=""
+OMI_HOME=/opt/omi
+CM_DIR=/var/opt/microsoft/cm
+CM_BINDIR=/opt/microsoft/cm
+
+ulinux_detect_openssl_version
+
+check_if_pkg_is_installed omi
+OMI_IS_INSTALLED=$?
+check_if_pkg_is_installed ccm
+CCM_IS_INSTALLED=$?
+
+parse_command_line_args $@
+check_command_line_args
+
+extract_tar_file
+validate_build_architecture
+
+echo "Beginning installation of Configuration Manager"
+
+MIGRATE_DS=0
+# If the ccm package is not installed, but upgrade was specified, check if old DS needs migration
+if [ $CCM_IS_INSTALLED -eq 1 -a $UPGRADE -eq 1 ]; then
+    # Check if CCM is installed in /opt/microsoft/configmgr or $CM_DIR
+    if [ -d "/opt/microsoft/configmgr/root" -o -d "$CM_DIR/root" ]; then
+        MIGRATE_DS=1
+    fi
+fi
+
+# If ccm is installed, remove it first if -clean option specified.  Otherwise, ask user.
+if [ $CCM_IS_INSTALLED -eq 0 ]; then
+    if [ $CLEAN_INSTALL -eq 1 ]; then
+        remove_ccm_package
+        remove_omi_package
+    elif [ $UPGRADE -eq 0 ]; then
+        userval=
+        while [ -z "$userval" ]; do
+            echo "Configuration Manager Agent is currently installed.  Do you wish to upgrade? (y/n)"
+            read userval
+            case "$userval" in
+                y|Y)
+                    UPGRADE=1
+                    userval="set"
+                    ;;
+                n|N)
+                    UPGRADE=0
+                    userval="set"
+                    cleanup_gracefully "Cancelling install. Please uninstall ccm first or install with the -clean option."
+                    exit 0
+                    ;;
+                *)
+                    echo "Error: Please enter either y/Y or n/N."
+                    userval=
+                    ;;
+            esac
+        done
+    fi
+fi
+
+if [ $CCM_IS_INSTALLED -ne 0 ]; then
+    UPGRADE=0
+fi
+
+write_env_files
+
+check_if_pkg_is_installed omi
+OMI_IS_INSTALLED=$?
+
+# If omi is still installed, upgrade it, otherwise install it
+if [ $OMI_IS_INSTALLED -eq 0 ]; then
+    check_if_attempt_omi_upgrade
+
+    if [ $? -ne 0 ]; then
+        upgrade_omi_package
+
+        if [ $? -ne 0 ]; then
+            cleanup_and_exit "Error: Failed to upgrade OMI"
+        fi
+    fi
+
+else
+    install_omi_package
+    if [ $? -ne 0 ]; then
+        cleanup_and_exit "Error: Failed to install OMI"
+    fi
+fi
+
+if [ $UPGRADE -eq 1 ]; then
+    upgrade_ccm_package
+    if [ $? -ne 0 ]; then
+        cleanup_and_exit "Error: Failed to upgrade ConfigMgr Agent"
+    fi
+else
+    install_ccm_package
+    if [ $? -ne 0 ]; then
+        cleanup_and_exit "Error: Failed to install ConfigMgr Agent"
+    fi
+fi
+
+cleanup_gracefully

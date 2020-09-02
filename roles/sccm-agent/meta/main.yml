@@ -1,0 +1,26 @@
+---
+galaxy_info:
+  author: Eder Queiroz
+  description: Installing sccm-agent windows for RedHat/Debian.
+  company: Hepta
+  min_ansible_version: 2.7
+  platforms:
+    - name: Centos
+      versions:
+        - 6
+        - 7
+        - 8
+    - name: Ubuntu
+      versions:
+        - trusty
+        - xenial
+        - bionic
+    - name: Debian
+      versions:
+        - jessie
+        - stretch
+        - buster
+  galaxy_tags:
+    - sccm
+    - 
+dependencies: []

@@ -1,0 +1,31 @@
+---
+# Realizando copia dos arquivos binarios para os servidores clients
+ - name: Copiando arquivos binarios sccm
+   #copy: src=ccm-* dest=/tmp/ force=yes owner=root group=root backup=yes
+   copy: src={{ item }} dest=/tmp/
+   with_items:
+    - install
+    - ccm-Universalx64.tar
+    - ccm-Universalx86.tar
+ - file:
+    path: /tmp/install
+    state: file
+    mode: 0777
+
+# Executando instalação do agent em servidores de arquitetura x64
+ - name: Executando instalacao agent arch-x64
+   shell: ./install -mp '{{ server_sccm }}' -sitecode '{{ site }}' ccm-Universalx64.tar -clean > sccm-log.txt
+   args:
+     chdir: /tmp/
+     executable: /bin/bash
+   notify: Reiniciando ccmexec
+   when: ansible_architecture == "x86_64"
+
+ - name: Executando instalacao agent arch-x86
+   shell: ./install -mp '{{ server_sccm }}' -sitecode '{{ site }}' ccm-Universalx86.tar -clean > sccm-log.txt
+   args:
+     chdir: /tmp/
+     executable: /bin/bash
+   notify: Reiniciando ccmexec
+   when: ansible_architecture == "x86"
+...
