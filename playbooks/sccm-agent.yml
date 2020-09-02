@@ -1,0 +1,8 @@
+---
+
+#Playbook de dev e hmg
+- name: Playbook de instalação de agent sccm - Linux Servers
+  hosts: sccm-test
+  roles:
+   - sccm-agent
+...
