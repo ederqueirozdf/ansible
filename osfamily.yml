@@ -1,0 +1,13 @@
+---
+#Playbook de teste para verificao de sistema operacional
+- hosts: all
+  tasks:
+   - name: Verifica versao RedHat
+     shell: echo "only on Red Hat 6"
+     when: ansible_facts['os_family'] == "RedHat" 
+      #and ansible_facts['lsb']['major_release']|int >= 6
+
+   - name: Verifica versao Debian
+     shell: echo "only on Debian"
+     when: ansible_facts['os_family'] == "Debian"  
+...
